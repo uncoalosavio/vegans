@@ -184,33 +184,85 @@ resource "aws_db_subnet_group" "main" {
   }
 }
 
-# RDS Instance
-resource "aws_db_instance" "mysql" {
-  identifier            = "enc-${var.project_name}-${var.env}"
-  engine                = "mysql"
-  engine_version        = "8.0"
-  instance_class        = "db.t4g.micro"
-  allocated_storage     = 20
-  storage_type          = "gp2"
-  db_name                  = "encrypted${var.project_name}${var.env}"
-  username              = local.db_creds.username
-  password              = local.db_creds.password
-  parameter_group_name  = aws_db_parameter_group.mysql.name
-  vpc_security_group_ids = [aws_security_group.database.id]
-  db_subnet_group_name  = aws_db_subnet_group.main.name
-  multi_az              = false
-  publicly_accessible   = false
-  storage_encrypted     = true
-  skip_final_snapshot   = var.env != "prod"
+# RDS Aurora Cluster
+resource "aws_rds_cluster" "aurora" {
+  cluster_identifier      = "${var.project_name}-aurora-cluster-${var.env}"
+  engine                  = "aurora-mysql"
+  engine_version          = "8.0.mysql_aurora.3.03.0"
+  database_name           = "encrypted${var.project_name}${var.env}"
+  master_username         = local.database_creds["username"]
+  master_password         = local.database_creds["password"]
+  backup_retention_period = 7
+  preferred_backup_window = "07:00-09:00"
+  db_subnet_group_name    = aws_db_subnet_group.main.name
+  vpc_security_group_ids  = [aws_security_group.database.id]
+  storage_encrypted       = true
 
   tags = {
-    Name = "encrypted-database-instance-${var.env}"
-  }
-
-  lifecycle {
-    create_before_destroy = true
+    Name = "${var.project_name}-aurora-cluster-${var.env}"
   }
 }
+
+resource "aws_rds_cluster_instance" "replica" {
+  count                    = 1
+  identifier               = "${var.project_name}-aurora-replica-${count.index}-${var.env}"
+  cluster_identifier       = aws_rds_cluster.aurora.id
+  instance_class           = "db.t4g.micro"
+  engine                   = aws_rds_cluster.aurora.engine
+  engine_version           = aws_rds_cluster.aurora.engine_version
+  publicly_accessible      = false
+  db_subnet_group_name     = aws_db_subnet_group.main.name
+  db_parameter_group_name  = aws_rds_cluster.aurora.db_cluster_parameter_group_name
+  monitoring_interval      = 30
+  performance_insights_enabled = true
+  promotion_tier           = 2
+
+  tags = {
+    Name = "${var.project_name}-aurora-replica-${count.index}-${var.env}"
+  }
+}
+
+# Enable Auto-scaling for Aurora Replicas
+resource "aws_appautoscaling_target" "aurora" {
+  max_capacity       = 8
+  min_capacity       = 1
+  resource_id        = "cluster:${aws_rds_cluster.aurora.id}"
+  scalable_dimension = "rds:cluster:ReadReplicaCount"
+  service_namespace  = "rds"
+}
+
+resource "aws_appautoscaling_policy" "scale_up" {
+  name               = "${var.project_name}-aurora-scale-up-${var.env}"
+  resource_id        = aws_appautoscaling_target.aurora.resource_id
+  scalable_dimension = aws_appautoscaling_target.aurora.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.aurora.service_namespace
+  policy_type        = "TargetTrackingScaling"
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "RDSReaderAverageCPUUtilization"
+    }
+    target_value       = 50.0
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 300
+  }
+}
+
+resource "aws_appautoscaling_policy" "scale_down" {
+  name               = "${var.project_name}-aurora-scale-down-${var.env}"
+  resource_id        = aws_appautoscaling_target.aurora.resource_id
+  scalable_dimension = aws_appautoscaling_target.aurora.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.aurora.service_namespace
+  policy_type        = "TargetTrackingScaling"
+  target_tracking_scaling_policy_configuration {
+    predefined_metric_specification {
+      predefined_metric_type = "RDSReaderAverageCPUUtilization"
+    }
+    target_value       = 20.0
+    scale_in_cooldown  = 300
+    scale_out_cooldown = 300
+  }
+}
+
 # ECS Cluster
 resource "aws_ecs_cluster" "cluster" {
   name = "${var.project_name}-cluster-${var.env}"
@@ -339,7 +391,7 @@ resource "aws_ecs_task_definition" "keycloak_task" {
         },
         {
           name  = "KC_DB_URL"
-          value = "jdbc:mysql://${aws_db_instance.mysql.endpoint}/keycloak"
+          value = "jdbc:mysql://${aws_rds_cluster.aurora.endpoint}/keycloak"
         },
         {
           name  = "KC_PROXY"
@@ -353,11 +405,11 @@ resource "aws_ecs_task_definition" "keycloak_task" {
       secrets = [
         {
           name      = "KC_DB_USERNAME"
-          valueFrom = local.db_creds.passwird
+          valueFrom = local.db_creds.username
         },
         {
           name      = "KC_DB_PASSWORD"
-          valueFrom = local.db_creds.passwird
+          valueFrom = local.db_creds.password
         }
       ]
       portMappings = [
@@ -406,6 +458,49 @@ resource "aws_ecs_service" "keycloak_service" {
   ]
 }
 
+
+# Auto Scaling Target
+resource "aws_appautoscaling_target" "ecs_service" {
+  max_capacity       = 8
+  min_capacity       = 1
+  resource_id        = "service/${aws_ecs_cluster.cluster.name}/${aws_ecs_service.keycloak_service.name}"
+  scalable_dimension = "ecs:service:DesiredCount"
+  service_namespace  = "ecs"
+}
+
+# Scaling Policy to Scale Out
+resource "aws_appautoscaling_policy" "scale_out" {
+  name               = "${var.project_name}-scale-out-${var.env}"
+  resource_id        = aws_appautoscaling_target.ecs_service.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_service.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_service.service_namespace
+  policy_type        = "TargetTrackingScaling"
+  target_tracking_scaling_policy_configuration {
+    target_value                          = 50.0
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    scale_out_cooldown  = 60
+    scale_in_cooldown   = 60
+  }
+}
+
+# Scaling Policy to Scale In
+resource "aws_appautoscaling_policy" "scale_in" {
+  name               = "${var.project_name}-scale-in-${var.env}"
+  resource_id        = aws_appautoscaling_target.ecs_service.resource_id
+  scalable_dimension = aws_appautoscaling_target.ecs_service.scalable_dimension
+  service_namespace  = aws_appautoscaling_target.ecs_service.service_namespace
+  policy_type        = "TargetTrackingScaling"
+  target_tracking_scaling_policy_configuration {
+    target_value                          = 20.0
+    predefined_metric_specification {
+      predefined_metric_type = "ECSServiceAverageCPUUtilization"
+    }
+    scale_out_cooldown  = 60
+    scale_in_cooldown   = 60
+  }
+}
 
 # Security Group for ALB
 resource "aws_security_group" "alb_sg" {

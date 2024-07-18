@@ -1,34 +1,56 @@
+name: Terraform Deploy
+
 on:
   push:
     branches:
-      - mybranch
+      - my_branch
 
 env:
-  TF_CLOUD_ORGANIZATION: "YOUR-ORGANIZATION-HERE"
-  TF_API_TOKEN: "${{ secrets.TF_API_TOKEN }}"
-  TF_WORKSPACE: "learn-terraform-github-actions"
-  CONFIG_DIRECTORY: "./"
-
+  TF_VERSION: '1.0.11'
+  AWS_REGION: 'us-east-1' # Change to your desired AWS region
 
 jobs:
   terraform:
-    name: "Terraform Plan"
+    name: 'Terraform Deploy'
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Upload Configuration
-        uses: hashicorp/tfc-workflows-github/actions/upload-configuration@v1.0.0
-        id: plan-upload
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v1
         with:
-          workspace: ${{ env.TF_WORKSPACE }}
-          directory: ${{ env.CONFIG_DIRECTORY }}
-      - name: Create Plan Run
-        uses: hashicorp/tfc-workflows-github/actions/create-run@v1.0.0
-        id: plan-run
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
         with:
-          workspace: ${{ env.TF_WORKSPACE }}
-          configuration_version: ${{ steps.plan-upload.outputs.configuration_version_id }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate
+
+      - name: Terraform Plan
+        run: terraform plan -out=plan.out
+        env:
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_https_certificate_arn: ${{ secrets.HTTPS_CERTIFICATE_ARN }}
+          TF_VAR_env: ${{ secrets.ENV }}
+          TF_VAR_secret_arn: ${{ secrets.SECRET_ARN }}
+          TF_VAR_base_domain: ${{ secrets.BASE_DOMAIN }}
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: terraform apply -auto-approve plan.out
+        env:
+          TF_VAR_project_name: ${{ secrets.PROJECT_NAME }}
+          TF_VAR_https_certificate_arn: ${{ secrets.HTTPS_CERTIFICATE_ARN }}
+          TF_VAR_env: ${{ secrets.ENV }}
+          TF_VAR_secret_arn: ${{ secrets.SECRET_ARN }}
+          TF_VAR_base_domain: ${{ secrets.BASE_DOMAIN }}
